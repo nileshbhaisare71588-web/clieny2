@@ -1,9 +1,10 @@
+# requirements.txt
 ccxt
 pandas
 numpy
+scikit-learn
 python-telegram-bot
 APScheduler
-Flask
 python-dotenv
+Flask
 gunicorn
-
