@@ -1,4 +1,4 @@
-# main.py - PREMIER FOREX AI QUANT V3.0 (Yahoo Finance Engine)
+# main.py - PREMIER FOREX AI QUANT V3.1 (Safe-Boot Edition)
 
 import os
 import yfinance as yf
@@ -17,254 +17,192 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
-# YAHOO FINANCE TICKER MAPPING
-# We map your requested pairs to Yahoo's specific format
+# Pairs Map
 PAIRS_CONFIG = {
     "GBP/JPY": "GBPJPY=X",
-    "XAU/USD": "GC=F",      # Gold Futures (Standard for XAU trading)
-    "AUD/CAD": "AUDCAD=X",
-    "EUR/USD": "EURUSD=X",  
-    "BTC/USD": "BTC-USD"    
+    "XAU/USD": "GC=F",      
+    "AUD/CAD": "AUDCAD=X"
 }
-
-# The pairs you specifically asked for
-ACTIVE_PAIRS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
+ACTIVE_PAIRS = list(PAIRS_CONFIG.keys())
 
 bot_stats = {
-    "status": "initializing",
+    "status": "booting",
     "total_analyses": 0,
-    "last_analysis": None,
-    "version": "V3.0 Yahoo Data"
+    "last_run": "Never",
+    "version": "V3.1 Safe-Boot"
 }
 
+app = Flask(__name__)
+
 # =========================================================================
-# === TELEGRAM ENGINE (Direct HTTP - Crash Proof) ===
+# === TELEGRAM ENGINE ===
 # =========================================================================
 
 def send_telegram_message(message):
-    """Sends message via HTTP to avoid asyncio event loop crashes."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"⚠️ Telegram Send Error: {e}")
+        print(f"⚠️ Telegram Error: {e}")
 
 def send_error_alert(symbol, error):
-    msg = (f"⚠️ <b>DATA ERROR: {symbol}</b>\nReason: {error}")
-    send_telegram_message(msg)
+    send_telegram_message(f"⚠️ <b>ERROR: {symbol}</b>\n{error}")
 
 # =========================================================================
-# === DATA ENGINE (Yahoo Finance) ===
+# === DATA & ANALYSIS ENGINE (Yahoo Finance) ===
 # =========================================================================
 
-def fetch_data_safe(user_symbol):
-    """Fetches data from Yahoo Finance."""
-    max_retries = 2
-    ticker = PAIRS_CONFIG.get(user_symbol)
+def fetch_data(symbol):
+    ticker = PAIRS_CONFIG.get(symbol)
+    if not ticker: return pd.DataFrame()
     
-    if not ticker: 
-        print(f"❌ Unknown ticker for {user_symbol}")
+    try:
+        # Fast download, no progress bar
+        df = yf.download(ticker, period="5d", interval="1h", progress=False)
+        if df.empty: return pd.DataFrame()
+        
+        # Cleanup
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df = df.rename(columns={"Date":"timestamp", "Open":"open", "High":"high", "Low":"low", "Close":"close"})
+        
+        # Force floats
+        cols = ['open','high','low','close']
+        for c in cols: 
+            if c in df.columns: df[c] = df[c].astype(float)
+            
+        return df
+    except Exception as e:
+        print(f"Data error {symbol}: {e}")
         return pd.DataFrame()
 
-    for attempt in range(max_retries):
-        try:
-            # Fetch 5 days of 1h data
-            df = yf.download(tickers=ticker, period="5d", interval="1h", progress=False)
-            
-            if df.empty: raise ValueError("No data returned")
-
-            # Clean up Yahoo's multi-index columns if present
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            # Rename columns to standard lowercase
-            df = df.rename(columns={
-                "Date": "timestamp", "Datetime": "timestamp", 
-                "Open": "open", "High": "high", "Low": "low", "Close": "close"
-            })
-            
-            # Ensure strictly float type (Fixes the np.float64 print error)
-            cols = ['open', 'high', 'low', 'close']
-            for c in cols:
-                if c in df.columns:
-                    df[c] = df[c].astype(float)
-            
-            return df
-        except Exception as e:
-            time.sleep(2)
-            
-    return pd.DataFrame()
-
-# =========================================================================
-# === ANALYTICAL ENGINES ===
-# =========================================================================
-
-def calculate_atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    return np.max(ranges, axis=1).rolling(period).mean()
-
-def detect_structure(df):
-    if len(df) < 20: return "NEUTRAL"
-    
-    # Simple Moving Average Trend Logic for stability
-    short_ma = df['close'].rolling(8).mean().iloc[-1]
-    long_ma = df['close'].rolling(21).mean().iloc[-1]
-
-    if short_ma > long_ma: return "BULLISH"
-    if short_ma < long_ma: return "BEARISH"
-    return "NEUTRAL"
-
-def detect_fvg(df):
-    # Scan last 5 candles
-    recent = df.iloc[-5:-1] 
-    fvg_zone, fvg_type = None, None
-    
-    for i in range(len(recent) - 2):
-        curr_high = float(recent.iloc[i]['high'])
-        next_low = float(recent.iloc[i+2]['low'])
-        
-        # Bullish FVG
-        if next_low > curr_high:
-            fvg_zone, fvg_type = (curr_high, next_low), "BULLISH_FVG"
-            
-        # Bearish FVG
-        curr_low = float(recent.iloc[i]['low'])
-        next_high = float(recent.iloc[i+2]['high'])
-        if next_high < curr_low:
-            fvg_zone, fvg_type = (next_high, curr_low), "BEARISH_FVG"
-            
-    return fvg_type, fvg_zone
-
-# =========================================================================
-# === SIGNAL GENERATOR ===
-# =========================================================================
-
-def generate_and_send_signal(symbol, force_send=False):
+def analyze_market(symbol, force=False):
     global bot_stats
-    try:
-        df = fetch_data_safe(symbol)
-        if df.empty: 
-            if force_send: send_error_alert(symbol, "Yahoo returned empty data")
-            return
+    df = fetch_data(symbol)
+    if df.empty:
+        if force: send_error_alert(symbol, "No Data from Yahoo")
+        return
 
-        price = float(df.iloc[-1]['close'])
-        structure = detect_structure(df)
-        
-        df['atr'] = calculate_atr(df)
-        # Fix: Handle case where ATR might be NaN at start
-        if pd.isna(df.iloc[-1]['atr']):
-            atr = price * 0.005 # Fallback to 0.5% if ATR fails
-        else:
-            atr = float(df.iloc[-1]['atr'])
-
-        fvg_type, fvg_zone = detect_fvg(df)
-
-        signal, color = "NEUTRAL (WAIT)", "⚪️"
-        
-        # --- STRATEGY LOGIC ---
-        if structure == "BULLISH" and fvg_type == "BULLISH_FVG":
-            signal, color = "STRONG BUY", "🟢"
-            sl = price - (1.5 * atr)
-            tp1 = price + (2.0 * atr)
-            tp2 = price + (3.5 * atr)
-            
-        elif structure == "BEARISH" and fvg_type == "BEARISH_FVG":
-            signal, color = "STRONG SELL", "🔴"
-            sl = price + (1.5 * atr)
-            tp1 = price - (2.0 * atr)
-            tp2 = price - (3.5 * atr)
-            
-        else:
-            if not force_send: return
-            # Default levels for status report
-            if structure == "BULLISH":
-                sl, tp1, tp2 = price-(2*atr), price+(2*atr), price+(3*atr)
-            else:
-                sl, tp1, tp2 = price+(2*atr), price-(2*atr), price-(3*atr)
-
-        # Formatting
-        dec = 2 # Gold/Yen usually 2 decimals
-        if "AUD" in symbol or "EUR" in symbol: dec = 5
-        
-        zone_txt = f"{fvg_zone[0]:.{dec}f} - {fvg_zone[1]:.{dec}f}" if fvg_zone else "None"
-
-        msg = (
-            f"<b>💎 V3.0 YAHOO SIGNAL</b>\n"
-            f"──────────────────────\n"
-            f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
-            f"<b>💵 PRICE:</b> <code>{price:.{dec}f}</code>\n"
-            f"──────────────────────\n"
-            f"<b>👉 DIRECTION: {color} {signal}</b>\n"
-            f"──────────────────────\n"
-            f"<b>🎯 TP 1:</b> <code>{tp1:.{dec}f}</code>\n"
-            f"<b>🚀 TP 2:</b> <code>{tp2:.{dec}f}</code>\n"
-            f"<b>🛑 SL:</b>  <code>{sl:.{dec}f}</code>\n"
-            f"──────────────────────\n"
-            f"<b>📊 ANALYSIS:</b>\n"
-            f"• <b>Trend:</b> {structure}\n"
-            f"• <b>Zone:</b> {zone_txt}\n"
-        )
-        send_telegram_message(msg)
-        bot_stats['total_analyses'] += 1
-        bot_stats['last_analysis'] = datetime.now().isoformat()
-
-    except Exception as e:
-        if force_send: send_error_alert(symbol, str(e))
-        print(f"❌ Failed {symbol}: {e}")
-
-# =========================================================================
-# === RUNNER ===
-# =========================================================================
-
-def keep_alive():
-    if APP_URL:
-        try: requests.get(f"{APP_URL}/health", timeout=5)
-        except: pass
-
-def start_bot():
-    print(f"🚀 Initializing V3.0 Yahoo Engine...")
+    # Indicators
+    price = float(df.iloc[-1]['close'])
     
-    # Startup Msg
-    pairs_str = ", ".join(ACTIVE_PAIRS)
-    threading.Thread(target=send_telegram_message, args=(
-        f"🟢 <b>SYSTEM ONLINE: V3.0</b>\n"
-        f"Sources: {pairs_str}\n"
-        f"<i>Starting Analysis...</i>",
-    )).start()
+    # Simple Trend
+    sma_short = df['close'].rolling(8).mean().iloc[-1]
+    sma_long = df['close'].rolling(21).mean().iloc[-1]
+    trend = "BULLISH" if sma_short > sma_long else "BEARISH"
+    
+    # ATR
+    high_low = df['high'] - df['low']
+    atr = float(high_low.rolling(14).mean().iloc[-1])
+    if pd.isna(atr) or atr == 0: atr = price * 0.005 # Fallback
+    
+    # FVG Scan
+    fvg_type, fvg_zone = None, None
+    recent = df.iloc[-5:-1]
+    for i in range(len(recent)-2):
+        if float(recent.iloc[i+2]['low']) > float(recent.iloc[i]['high']):
+            fvg_type, fvg_zone = "BULLISH_FVG", (recent.iloc[i]['high'], recent.iloc[i+2]['low'])
+        if float(recent.iloc[i+2]['high']) < float(recent.iloc[i]['low']):
+            fvg_type, fvg_zone = "BEARISH_FVG", (recent.iloc[i+2]['high'], recent.iloc[i]['low'])
 
+    # Signal Logic
+    signal, color = "NEUTRAL", "⚪️"
+    
+    if trend == "BULLISH" and fvg_type == "BULLISH_FVG":
+        signal, color = "STRONG BUY", "🟢"
+        sl, tp1, tp2 = price-(1.5*atr), price+(2*atr), price+(3.5*atr)
+    elif trend == "BEARISH" and fvg_type == "BEARISH_FVG":
+        signal, color = "STRONG SELL", "🔴"
+        sl, tp1, tp2 = price+(1.5*atr), price-(2*atr), price-(3.5*atr)
+    else:
+        if not force: return
+        # Default levels for test/status
+        sl = price-(2*atr) if trend == "BULLISH" else price+(2*atr)
+        tp1, tp2 = (price+(2*atr), price+(3*atr)) if trend == "BULLISH" else (price-(2*atr), price-(3*atr))
+
+    # Send Message
+    dec = 2 if "JPY" in symbol or "XAU" in symbol else 5
+    z_txt = f"{fvg_zone[0]:.{dec}f}-{fvg_zone[1]:.{dec}f}" if fvg_zone else "None"
+    
+    msg = (
+        f"<b>💎 V3.1 SIGNAL</b>\n"
+        f"────────────────\n"
+        f"<b>🪙 {symbol}</b> | <b>💵 {price:.{dec}f}</b>\n"
+        f"────────────────\n"
+        f"<b>👉 {color} {signal}</b>\n"
+        f"────────────────\n"
+        f"<b>TP1:</b> {tp1:.{dec}f} | <b>TP2:</b> {tp2:.{dec}f}\n"
+        f"<b>SL:</b>  {sl:.{dec}f}\n"
+        f"────────────────\n"
+        f"Trend: {trend} | Zone: {z_txt}"
+    )
+    send_telegram_message(msg)
+    bot_stats['total_analyses'] += 1
+    bot_stats['last_run'] = datetime.now().isoformat()
+
+# =========================================================================
+# === SCHEDULER & BOOTSTRAP ===
+# =========================================================================
+
+def run_scheduler():
     scheduler = BackgroundScheduler()
-    # Runs every 30 mins
+    # Run every 30 mins
     for s in ACTIVE_PAIRS:
-        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s, False])
-    
-    scheduler.add_job(keep_alive, 'interval', minutes=10)
+        scheduler.add_job(analyze_market, 'cron', minute='0,30', args=[s, False])
     scheduler.start()
+    print("⏰ Scheduler Started")
+
+def boot_sequence():
+    """Runs 10 seconds AFTER app start to prevent timeouts"""
+    time.sleep(10)
+    print("🚀 Running Boot Sequence...")
+    run_scheduler()
     
-    # FORCE RUN NOW (With 10s delay to let server boot)
-    def delayed_start():
-        time.sleep(10) 
-        for s in ACTIVE_PAIRS:
-            generate_and_send_signal(s, True)
-            
-    threading.Thread(target=delayed_start).start()
+    # Send Startup Msg
+    send_telegram_message(f"🟢 <b>SYSTEM ONLINE: V3.1</b>\nYahoo Engine Ready.\nWaiting for signals...")
+    
+    # Force run once to verify data
+    for s in ACTIVE_PAIRS:
+        analyze_market(s, True)
 
-# Start the bot logic
-start_bot()
+# Start background thread immediately, but it waits 10s before doing work
+threading.Thread(target=boot_sequence, daemon=True).start()
 
-# Flask App for Render
-app = Flask(__name__)
+# =========================================================================
+# === WEB INTERFACE (For Debugging) ===
+# =========================================================================
 
 @app.route('/')
-def home(): return render_template_string("<h3>V3.0 Yahoo Bot Running</h3>")
+def home():
+    return render_template_string("""
+    <html>
+        <body style="background:#111; color:white; font-family:sans-serif; text-align:center; padding:50px;">
+            <h1>🤖 V3.1 Dashboard</h1>
+            <p>Status: <span style="color:#0f0;">Online</span></p>
+            <p>Analyses Sent: {{ total }}</p>
+            <hr>
+            <h3>👇 Troubleshooting 👇</h3>
+            <a href="/trigger" style="background:#f00; color:white; padding:15px; text-decoration:none; border-radius:5px;">
+                CLICK TO FORCE TEST SIGNALS
+            </a>
+        </body>
+    </html>
+    """, total=bot_stats['total_analyses'])
+
+@app.route('/trigger')
+def trigger():
+    # Manual Trigger Endpoint
+    def run_manual():
+        send_telegram_message("⚠️ <b>Manual Test Triggered...</b>")
+        for s in ACTIVE_PAIRS:
+            analyze_market(s, True)
+    
+    threading.Thread(target=run_manual).start()
+    return "Signals Triggered! Check Telegram.", 200
 
 @app.route('/health')
-def health(): return jsonify({"status": "healthy"}), 200
+def health(): return "OK", 200
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
