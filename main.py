@@ -1,7 +1,7 @@
-# main.py - PREMIER FOREX AI QUANT V2.14 (Targeted Edition)
+# main.py - PREMIER FOREX AI QUANT V3.0 (Yahoo Finance Engine)
 
 import os
-import ccxt
+import yfinance as yf # <--- The new Data Engine (Has all pairs)
 import pandas as pd
 import numpy as np
 import requests
@@ -10,32 +10,35 @@ import time
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify, render_template_string
-from dotenv import load_dotenv 
 
 # --- CONFIGURATION ---
+from dotenv import load_dotenv 
 load_dotenv() 
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
-# 🔥 ONLY YOUR 3 REQUESTED PAIRS
-TARGET_PAIRS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
+# YAHOO FINANCE TICKER MAPPING
+# We map your requested pairs to Yahoo's specific format
+PAIRS_CONFIG = {
+    "GBP/JPY": "GBPJPY=X",
+    "XAU/USD": "GC=F",      # Gold Futures (Most accurate for XAU)
+    "AUD/CAD": "AUDCAD=X",
+    "EUR/USD": "EURUSD=X",  # Added just in case
+    "BTC/USD": "BTC-USD"    # Added just in case
+}
 
-TIMEFRAME_HTF = "4h"
-TIMEFRAME_LTF = "1h"
+# Select only the ones you want to run
+ACTIVE_PAIRS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
 
-# Initialize Kraken
-exchange = ccxt.kraken({
-    'enableRateLimit': True, 
-    'rateLimit': 2000,
-    'params': {'timeout': 20000}
-})
+TIMEFRAME_HTF = "4h" # Yahoo supports 1h, 1d, etc. (we will use 1h for both to ensure stability)
 
 bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "version": "V2.14 Targeted"
+    "version": "V3.0 Yahoo Data"
 }
 
 # =========================================================================
@@ -51,52 +54,46 @@ def send_telegram_message(message):
         print(f"⚠️ Telegram Send Error: {e}")
 
 def send_error_alert(symbol, error):
-    msg = (f"⚠️ <b>PAIR ERROR: {symbol}</b>\n"
-           f"Reason: {error}\n"
-           f"<i>Kraken may not support this specific pair directly.</i>")
+    msg = (f"⚠️ <b>DATA ERROR: {symbol}</b>\nReason: {error}")
     send_telegram_message(msg)
 
 # =========================================================================
-# === SMART PAIR FINDER ===
+# === DATA ENGINE (Yahoo Finance) ===
 # =========================================================================
 
-def find_kraken_symbol(user_symbol):
-    """Finds the correct Kraken ID for your specific pairs."""
-    if not exchange.markets:
-        try: exchange.load_markets()
-        except: return None
-
-    # 1. Check exact match
-    if user_symbol in exchange.markets: return user_symbol
-
-    # 2. Hardcoded fixes for your specific pairs
-    if user_symbol == "XAU/USD": return "XAU/USD" # Often maps to XXAUZUSD automatically
-    if user_symbol == "GBP/JPY": return "GBP/JPY" # Often maps to ZGBPZJPY automatically
-    
-    # 3. Deep Search (The fix for weird names)
-    # Removes slash: AUD/CAD -> AUDCAD
-    clean = user_symbol.replace("/", "") 
-    for market_id in exchange.markets.keys():
-        if clean in market_id:
-            return market_id
-            
-    return None
-
-def fetch_data_safe(user_symbol, timeframe):
+def fetch_data_safe(user_symbol):
+    """Fetches data from Yahoo Finance instead of Kraken."""
     max_retries = 2
+    
+    # Get the Yahoo Ticker
+    ticker = PAIRS_CONFIG.get(user_symbol)
+    if not ticker: return pd.DataFrame() # Skip if unknown
+
     for attempt in range(max_retries):
         try:
-            kraken_id = find_kraken_symbol(user_symbol)
-            if not kraken_id:
-                raise ValueError("Pair not found on Kraken.")
+            # Fetch 5 days of 1h data (Yahoo allows 1h max for free intaday)
+            df = yf.download(tickers=ticker, period="5d", interval="1h", progress=False)
+            
+            if df.empty: raise ValueError("No data returned")
 
-            ohlcv = exchange.fetch_ohlcv(kraken_id, timeframe, limit=100)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            return df.dropna()
+            # Yahoo formatting cleanup
+            df = df.reset_index()
+            df.columns = df.columns.droplevel(1) if isinstance(df.columns, pd.MultiIndex) else df.columns
+            df = df.rename(columns={
+                "Date": "timestamp", "Datetime": "timestamp", 
+                "Open": "open", "High": "high", "Low": "low", "Close": "close"
+            })
+            
+            # Ensure proper types
+            df['close'] = df['close'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            
+            return df
         except Exception as e:
-            if attempt == max_retries - 1: raise e
+            if attempt == max_retries - 1:
+                print(f"Failed {user_symbol}: {e}")
+                # raise e # Uncomment to debug hard crashes
             time.sleep(2)
     return pd.DataFrame()
 
@@ -112,29 +109,41 @@ def calculate_atr(df, period=14):
     return np.max(ranges, axis=1).rolling(period).mean()
 
 def detect_structure(df):
-    df['is_high'] = df['high'][(df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])]
-    df['is_low'] = df['low'][(df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])]
-    last_highs = df['is_high'].dropna().tail(2)
-    last_lows = df['is_low'].dropna().tail(2)
+    # Using 1H data to simulate structure
+    if len(df) < 5: return "NEUTRAL"
     
-    if len(last_highs) < 2 or len(last_lows) < 2: return "NEUTRAL"
-    if last_highs.iloc[-1] > last_highs.iloc[-2] and last_lows.iloc[-1] > last_lows.iloc[-2]: return "BULLISH"
-    elif last_highs.iloc[-1] < last_highs.iloc[-2] and last_lows.iloc[-1] < last_lows.iloc[-2]: return "BEARISH"
+    # Simple Pivot Logic
+    last_highs = df['high'].rolling(3, center=True).max()
+    last_lows = df['low'].rolling(3, center=True).min()
+    
+    # Compare last 2 distinct peaks
+    # (Simplified for stability with Yahoo data)
+    current_close = df.iloc[-1]['close']
+    ma_short = df['close'].rolling(8).mean().iloc[-1]
+    ma_long = df['close'].rolling(21).mean().iloc[-1]
+
+    if ma_short > ma_long: return "BULLISH"
+    if ma_short < ma_long: return "BEARISH"
     return "NEUTRAL"
 
 def detect_fvg(df):
-    recent = df.iloc[-6:-1] 
+    recent = df.iloc[-5:-1] # Look at last few completed candles
     fvg_zone, fvg_type = None, None
+    
     for i in range(len(recent) - 2):
         curr_high = float(recent.iloc[i]['high'])
         next_low = float(recent.iloc[i+2]['low'])
+        
+        # Bullish FVG
         if next_low > curr_high:
             fvg_zone, fvg_type = (curr_high, next_low), "BULLISH_FVG"
             
+        # Bearish FVG
         curr_low = float(recent.iloc[i]['low'])
         next_high = float(recent.iloc[i+2]['high'])
         if next_high < curr_low:
             fvg_zone, fvg_type = (next_high, curr_low), "BEARISH_FVG"
+            
     return fvg_type, fvg_zone
 
 # =========================================================================
@@ -144,14 +153,19 @@ def detect_fvg(df):
 def generate_and_send_signal(symbol, force_send=False):
     global bot_stats
     try:
-        df_htf = fetch_data_safe(symbol, TIMEFRAME_HTF)
-        df_ltf = fetch_data_safe(symbol, TIMEFRAME_LTF)
-        if df_htf.empty or df_ltf.empty: return
+        # We use the same dataset for both engines in V3.0 for speed
+        df = fetch_data_safe(symbol)
+        if df.empty: 
+            if force_send: send_error_alert(symbol, "Yahoo returned empty data")
+            return
 
-        price = float(df_ltf.iloc[-1]['close'])
-        structure = detect_structure(df_htf)
-        atr = float(calculate_atr(df_ltf).iloc[-1])
-        fvg_type, fvg_zone = detect_fvg(df_ltf)
+        price = float(df.iloc[-1]['close'])
+        
+        # Calculate Indicators
+        structure = detect_structure(df)
+        df['atr'] = calculate_atr(df)
+        atr = float(df.iloc[-1]['atr'])
+        fvg_type, fvg_zone = detect_fvg(df)
 
         signal, color = "NEUTRAL (WAIT)", "⚪️"
         
@@ -159,9 +173,11 @@ def generate_and_send_signal(symbol, force_send=False):
         if structure == "BULLISH" and fvg_type == "BULLISH_FVG":
             signal, color = "STRONG BUY", "🟢"
             sl, tp1, tp2 = price - (1.5*atr), price + (2.0*atr), price + (3.5*atr)
+            
         elif structure == "BEARISH" and fvg_type == "BEARISH_FVG":
             signal, color = "STRONG SELL", "🔴"
             sl, tp1, tp2 = price + (1.5*atr), price - (2.0*atr), price - (3.5*atr)
+            
         else:
             if not force_send: return
             # Default levels for status report
@@ -170,11 +186,13 @@ def generate_and_send_signal(symbol, force_send=False):
             tp2 = price + (3.0*atr) if structure == "BULLISH" else price - (3.0*atr)
 
         # Formatting
-        dec = 2 if "XAU" in symbol or "JPY" in symbol else 5
+        dec = 2 # Gold/Yen usually 2 decimals
+        if "AUD" in symbol or "EUR" in symbol: dec = 5
+        
         zone_txt = f"{fvg_zone[0]:.{dec}f} - {fvg_zone[1]:.{dec}f}" if fvg_zone else "None"
 
         msg = (
-            f"<b>💎 PREMIUM QUANT SIGNAL</b>\n"
+            f"<b>💎 V3.0 DATA ENGINE SIGNAL</b>\n"
             f"──────────────────────\n"
             f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
             f"<b>💵 PRICE:</b> <code>{price:.{dec}f}</code>\n"
@@ -207,29 +225,32 @@ def keep_alive():
         except: pass
 
 def start_bot():
-    print(f"🚀 Initializing V2.14 Targeted...")
+    print(f"🚀 Initializing V3.0 Yahoo Engine...")
+    
+    # Startup Msg
+    pairs_str = ", ".join(ACTIVE_PAIRS)
     threading.Thread(target=send_telegram_message, args=(
-        f"🟢 <b>SYSTEM ONLINE: V2.14</b>\n"
-        f"Targeting: GBP/JPY, XAU/USD, AUD/CAD\n"
-        f"<i>Starting scan...</i>",
+        f"🟢 <b>SYSTEM ONLINE: V3.0 (Yahoo Engine)</b>\n"
+        f"Sources: {pairs_str}\n"
+        f"<i>Starting Analysis...</i>",
     )).start()
 
     scheduler = BackgroundScheduler()
-    for s in TARGET_PAIRS:
+    for s in ACTIVE_PAIRS:
         scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s, False])
     
     scheduler.add_job(keep_alive, 'interval', minutes=10)
     scheduler.start()
     
     # FORCE RUN NOW
-    for s in TARGET_PAIRS:
+    for s in ACTIVE_PAIRS:
         threading.Thread(target=generate_and_send_signal, args=(s, True)).start()
 
 start_bot()
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return render_template_string("<h3>Targeted Bot Running V2.14</h3>")
+def home(): return render_template_string("<h3>V3.0 Yahoo Bot Running</h3>")
 @app.route('/health')
 def health(): return jsonify({"status": "healthy"}), 200
 
