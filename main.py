@@ -1,195 +1,235 @@
-# main.py - PREMIER FOREX AI QUANT V2.5 (Render Optimized)
+# main.py - PREMIER FOREX AI QUANT V2.14 (Targeted Edition)
 
 import os
 import ccxt
 import pandas as pd
 import numpy as np
-import asyncio
-from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Bot
-from flask import Flask, jsonify, render_template_string
+import requests
 import threading
 import time
-import traceback 
-
-# --- ML Imports ---
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler 
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, jsonify, render_template_string
+from dotenv import load_dotenv 
 
 # --- CONFIGURATION ---
-from dotenv import load_dotenv 
 load_dotenv() 
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", "EUR/USD,GBP/USD,USD/JPY").split(',')]
-TIMEFRAME_MAIN = "4h"  # Major Trend
-TIMEFRAME_ENTRY = "1h" # Entry Precision
+APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
-# Initialize Bot and Exchange (Defaulting to Kraken for India/Forex Stability)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# 🔥 ONLY YOUR 3 REQUESTED PAIRS
+TARGET_PAIRS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
+
+TIMEFRAME_HTF = "4h"
+TIMEFRAME_LTF = "1h"
+
+# Initialize Kraken
 exchange = ccxt.kraken({
     'enableRateLimit': True, 
     'rateLimit': 2000,
-    'params': {'timeout': 20000} # Explicit 20s timeout
+    'params': {'timeout': 20000}
 })
 
 bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "monitored_assets": FOREX_PAIRS,
-    "uptime_start": datetime.now().isoformat(),
-    "version": "V2.5 Forex Elite Quant"
+    "version": "V2.14 Targeted"
 }
 
 # =========================================================================
-# === ADVANCED QUANT LOGIC ===
+# === TELEGRAM ENGINE (Direct HTTP) ===
 # =========================================================================
 
-def get_pip_value(pair):
-    return 0.01 if 'JPY' in pair else 0.0001
+def send_telegram_message(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Telegram Send Error: {e}")
 
-def calculate_cpr_levels(df_daily):
-    """Calculates Pivot Points for Institutional Target Setting."""
-    if df_daily.empty or len(df_daily) < 2: return None
-    prev_day = df_daily.iloc[-2]
-    H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
-    PP = (H + L + C) / 3.0
-    BC = (H + L) / 2.0
-    TC = PP - BC + PP
-    return {
-        'PP': PP, 'TC': TC, 'BC': BC,
-        'R1': 2*PP - L, 'S1': 2*PP - H,
-        'R2': PP + (H - L), 'S2': PP - (H - L)
-    }
+def send_error_alert(symbol, error):
+    msg = (f"⚠️ <b>PAIR ERROR: {symbol}</b>\n"
+           f"Reason: {error}\n"
+           f"<i>Kraken may not support this specific pair directly.</i>")
+    send_telegram_message(msg)
 
-def fetch_data_safe(symbol, timeframe):
-    """Robust fetcher with retries and symbol ID normalization."""
-    max_retries = 3
+# =========================================================================
+# === SMART PAIR FINDER ===
+# =========================================================================
+
+def find_kraken_symbol(user_symbol):
+    """Finds the correct Kraken ID for your specific pairs."""
+    if not exchange.markets:
+        try: exchange.load_markets()
+        except: return None
+
+    # 1. Check exact match
+    if user_symbol in exchange.markets: return user_symbol
+
+    # 2. Hardcoded fixes for your specific pairs
+    if user_symbol == "XAU/USD": return "XAU/USD" # Often maps to XXAUZUSD automatically
+    if user_symbol == "GBP/JPY": return "GBP/JPY" # Often maps to ZGBPZJPY automatically
+    
+    # 3. Deep Search (The fix for weird names)
+    # Removes slash: AUD/CAD -> AUDCAD
+    clean = user_symbol.replace("/", "") 
+    for market_id in exchange.markets.keys():
+        if clean in market_id:
+            return market_id
+            
+    return None
+
+def fetch_data_safe(user_symbol, timeframe):
+    max_retries = 2
     for attempt in range(max_retries):
         try:
-            if not exchange.markets: exchange.load_markets()
-            market_id = exchange.market(symbol)['id']
-            ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
+            kraken_id = find_kraken_symbol(user_symbol)
+            if not kraken_id:
+                raise ValueError("Pair not found on Kraken.")
+
+            ohlcv = exchange.fetch_ohlcv(kraken_id, timeframe, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            df['sma9'] = df['close'].rolling(9).mean()
-            df['sma20'] = df['close'].rolling(20).mean()
             return df.dropna()
-        except Exception:
-            if attempt < max_retries - 1: time.sleep(5)
+        except Exception as e:
+            if attempt == max_retries - 1: raise e
+            time.sleep(2)
     return pd.DataFrame()
 
 # =========================================================================
-# === MULTI-TIMEFRAME CONFLUENCE ENGINE ===
+# === ANALYTICAL ENGINES ===
 # =========================================================================
 
-def generate_and_send_signal(symbol):
+def calculate_atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    return np.max(ranges, axis=1).rolling(period).mean()
+
+def detect_structure(df):
+    df['is_high'] = df['high'][(df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])]
+    df['is_low'] = df['low'][(df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])]
+    last_highs = df['is_high'].dropna().tail(2)
+    last_lows = df['is_low'].dropna().tail(2)
+    
+    if len(last_highs) < 2 or len(last_lows) < 2: return "NEUTRAL"
+    if last_highs.iloc[-1] > last_highs.iloc[-2] and last_lows.iloc[-1] > last_lows.iloc[-2]: return "BULLISH"
+    elif last_highs.iloc[-1] < last_highs.iloc[-2] and last_lows.iloc[-1] < last_lows.iloc[-2]: return "BEARISH"
+    return "NEUTRAL"
+
+def detect_fvg(df):
+    recent = df.iloc[-6:-1] 
+    fvg_zone, fvg_type = None, None
+    for i in range(len(recent) - 2):
+        curr_high = float(recent.iloc[i]['high'])
+        next_low = float(recent.iloc[i+2]['low'])
+        if next_low > curr_high:
+            fvg_zone, fvg_type = (curr_high, next_low), "BULLISH_FVG"
+            
+        curr_low = float(recent.iloc[i]['low'])
+        next_high = float(recent.iloc[i+2]['high'])
+        if next_high < curr_low:
+            fvg_zone, fvg_type = (next_high, curr_low), "BEARISH_FVG"
+    return fvg_type, fvg_zone
+
+# =========================================================================
+# === SIGNAL GENERATOR ===
+# =========================================================================
+
+def generate_and_send_signal(symbol, force_send=False):
     global bot_stats
     try:
-        # 1. Multi-Timeframe Confluence
-        df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
-        df_1h = fetch_data_safe(symbol, TIMEFRAME_ENTRY)
-        
-        # 2. Daily Data for CPR Targets
-        if not exchange.markets: exchange.load_markets()
-        market_id = exchange.market(symbol)['id']
-        ohlcv_d = exchange.fetch_ohlcv(market_id, '1d', limit=5)
-        df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        cpr = calculate_cpr_levels(df_d)
+        df_htf = fetch_data_safe(symbol, TIMEFRAME_HTF)
+        df_ltf = fetch_data_safe(symbol, TIMEFRAME_LTF)
+        if df_htf.empty or df_ltf.empty: return
 
-        if df_4h.empty or df_1h.empty or cpr is None: return
+        price = float(df_ltf.iloc[-1]['close'])
+        structure = detect_structure(df_htf)
+        atr = float(calculate_atr(df_ltf).iloc[-1])
+        fvg_type, fvg_zone = detect_fvg(df_ltf)
 
-        # 3. Analyze Trend Confluence
-        price = df_4h.iloc[-1]['close']
-        trend_4h = "BULLISH" if df_4h.iloc[-1]['sma9'] > df_4h.iloc[-1]['sma20'] else "BEARISH"
-        trend_1h = "BULLISH" if df_1h.iloc[-1]['sma9'] > df_1h.iloc[-1]['sma20'] else "BEARISH"
+        signal, color = "NEUTRAL (WAIT)", "⚪️"
         
-        # 4. Master Logic
-        signal = "HOLD / WAIT"
-        emoji = "⏳"
-        
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH" and price > cpr['PP']:
-            signal = "STRONG BUY"
-            emoji = "🚀"
-        elif trend_4h == "BEARISH" and trend_1h == "BEARISH" and price < cpr['PP']:
-            signal = "STRONG SELL"
-            emoji = "🔻"
+        # --- LOGIC ---
+        if structure == "BULLISH" and fvg_type == "BULLISH_FVG":
+            signal, color = "STRONG BUY", "🟢"
+            sl, tp1, tp2 = price - (1.5*atr), price + (2.0*atr), price + (3.5*atr)
+        elif structure == "BEARISH" and fvg_type == "BEARISH_FVG":
+            signal, color = "STRONG SELL", "🔴"
+            sl, tp1, tp2 = price + (1.5*atr), price - (2.0*atr), price - (3.5*atr)
+        else:
+            if not force_send: return
+            # Default levels for status report
+            sl = price - (2.0*atr) if structure == "BULLISH" else price + (2.0*atr)
+            tp1 = price + (2.0*atr) if structure == "BULLISH" else price - (2.0*atr)
+            tp2 = price + (3.0*atr) if structure == "BULLISH" else price - (3.0*atr)
 
-        # 5. Risk Management Targets
-        is_buy = "BUY" in signal
-        tp1 = cpr['R1'] if is_buy else cpr['S1']
-        tp2 = cpr['R2'] if is_buy else cpr['S2']
-        sl = min(cpr['BC'], cpr['TC']) if is_buy else max(cpr['BC'], cpr['TC'])
-        
-        decimals = 5 if 'JPY' not in symbol else 3
+        # Formatting
+        dec = 2 if "XAU" in symbol or "JPY" in symbol else 5
+        zone_txt = f"{fvg_zone[0]:.{dec}f} - {fvg_zone[1]:.{dec}f}" if fvg_zone else "None"
 
-        # --- PREMIUM SIGNAL TEMPLATE ---
-        message = (
-            f"╔════════════════════════════════╗\n"
-            f"  🌍 <b>PREMIER FOREX AI QUANT</b>\n"
-            f"╚════════════════════════════════╝\n\n"
-            f"<b>Pair:</b> {symbol}\n"
-            f"<b>Rate:</b> <code>{price:.{decimals}f}</code>\n\n"
-            f"--- 🚨 {emoji} <b>SIGNAL: {signal}</b> 🚨 ---\n\n"
-            f"<b>📈 CONFLUENCE ANALYSIS:</b>\n"
-            f"• 4H Trend: <code>{trend_4h}</code>\n"
-            f"• 1H Trend: <code>{trend_1h}</code>\n"
-            f"• Pivot: {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
-            f"<b>🎯 TARGET LEVELS:</b>\n"
-            f"✅ <b>Take Profit 1:</b> <code>{tp1:.{decimals}f}</code>\n"
-            f"🔥 <b>Take Profit 2:</b> <code>{tp2:.{decimals}f}</code>\n"
-            f"🛑 <b>Stop Loss:</b> <code>{sl:.{decimals}f}</code>\n\n"
-            f"----------------------------------------\n"
-            f"<i>Verified AI Forex Analysis V2.5 Elite</i>"
+        msg = (
+            f"<b>💎 PREMIUM QUANT SIGNAL</b>\n"
+            f"──────────────────────\n"
+            f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
+            f"<b>💵 PRICE:</b> <code>{price:.{dec}f}</code>\n"
+            f"──────────────────────\n"
+            f"<b>👉 DIRECTION: {color} {signal}</b>\n"
+            f"──────────────────────\n"
+            f"<b>🎯 TP 1:</b> <code>{tp1:.{dec}f}</code>\n"
+            f"<b>🚀 TP 2:</b> <code>{tp2:.{dec}f}</code>\n"
+            f"<b>🛑 SL:</b>  <code>{sl:.{dec}f}</code>\n"
+            f"──────────────────────\n"
+            f"<b>📊 ANALYSIS:</b>\n"
+            f"• <b>Trend:</b> {structure}\n"
+            f"• <b>Zone:</b> {zone_txt}\n"
         )
-
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
-        
+        send_telegram_message(msg)
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
-        bot_stats['status'] = "operational"
 
     except Exception as e:
-        print(f"❌ Analysis failed: {e}")
+        if force_send: send_error_alert(symbol, str(e))
+        print(f"❌ Failed {symbol}: {e}")
 
 # =========================================================================
-# === GUNICORN-SAFE INITIALIZATION ===
+# === RUNNER ===
 # =========================================================================
+
+def keep_alive():
+    if APP_URL:
+        try: requests.get(f"{APP_URL}/health", timeout=5)
+        except: pass
 
 def start_bot():
-    print(f"🚀 Initializing {bot_stats['version']}...")
+    print(f"🚀 Initializing V2.14 Targeted...")
+    threading.Thread(target=send_telegram_message, args=(
+        f"🟢 <b>SYSTEM ONLINE: V2.14</b>\n"
+        f"Targeting: GBP/JPY, XAU/USD, AUD/CAD\n"
+        f"<i>Starting scan...</i>",
+    )).start()
+
     scheduler = BackgroundScheduler()
-    for s in FOREX_PAIRS:
-        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s])
+    for s in TARGET_PAIRS:
+        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s, False])
+    
+    scheduler.add_job(keep_alive, 'interval', minutes=10)
     scheduler.start()
     
-    # Run immediate baseline check in separate threads
-    for s in FOREX_PAIRS:
-        threading.Thread(target=generate_and_send_signal, args=(s,)).start()
+    # FORCE RUN NOW
+    for s in TARGET_PAIRS:
+        threading.Thread(target=generate_and_send_signal, args=(s, True)).start()
 
-# Start bot outside main block for Gunicorn support
 start_bot()
 
 app = Flask(__name__)
-
 @app.route('/')
-def home():
-    return render_template_string("""
-        <body style="font-family:sans-serif; background:#020617; color:#f8fafc; text-align:center; padding-top:100px;">
-            <div style="background:#0f172a; display:inline-block; padding:40px; border-radius:12px; border:1px solid #1e293b;">
-                <h1 style="color:#38bdf8;">Forex AI Pro Dashboard</h1>
-                <p>Status: <span style="color:#4ade80;">Active</span> | Version: {{v}}</p>
-                <hr style="border-color:#1e293b;">
-                <p>Analyses Streamed: <b>{{a}}</b></p>
-                <p style="font-size:0.8em; color:#94a3b8;">{{t}}</p>
-            </div>
-        </body>
-    """, a=bot_stats['total_analyses'], v=bot_stats['version'], t=bot_stats['last_analysis'])
-
+def home(): return render_template_string("<h3>Targeted Bot Running V2.14</h3>")
 @app.route('/health')
 def health(): return jsonify({"status": "healthy"}), 200
 
