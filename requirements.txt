@@ -1,10 +1,9 @@
-ccxt>=4.0.0
-pandas>=2.0.0
-numpy>=1.26.0
+ccxt
+pandas
+numpy
+python-telegram-bot
+APScheduler
+Flask
+python-dotenv
+gunicorn
 
-python-telegram-bot==13.15
-APScheduler>=3.10.0
-Flask>=2.3.0
-python-dotenv>=1.0.0
-
-gunicorn>=21.2.0
