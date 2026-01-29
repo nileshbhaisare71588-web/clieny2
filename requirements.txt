@@ -1,8 +1,8 @@
-flask
-gunicorn
 python-telegram-bot
-ccxt
 pandas
 numpy
+flask
 apscheduler
-python-dotenv
+gunicorn
+requests
+yfinance
