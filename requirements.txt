@@ -1,9 +1,8 @@
+flask
+gunicorn
+python-telegram-bot
 ccxt
 pandas
 numpy
-python-telegram-bot
-APScheduler
-scikit-learn
+apscheduler
 python-dotenv
-gunicorn
-Flask
